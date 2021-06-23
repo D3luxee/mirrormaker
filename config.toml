@@ -1,0 +1,21 @@
+[producer]
+kafka.nodes = [
+	"node1:9092",
+	"node2:9092",
+]
+kafka.topic = "some_dst_topic"
+compression = "snappy"
+#Partitioner: hash, keepPartition, random
+partitioner = "hash"
+flush.fequency = 1s
+flush.bytes = 5388608
+
+[consumer]
+zookeeper.connect = "zookeeper:2181/zkroot"
+group.id = "my-consumer-group"
+topic = "mytopic"
+
+[graphite]
+address = "metrics.lan:2003"
+prefix = "some.$hostname"
+interval = 30s
