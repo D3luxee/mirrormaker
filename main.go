@@ -12,14 +12,15 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"context"
+	"sync"
 
 	"github.com/Shopify/sarama"
+	"crypto/tls"
 	graphite "github.com/cyberdelia/go-metrics-graphite"
 	"github.com/rcrowley/go-metrics"
 
 	"github.com/spf13/viper"
-	"github.com/wvanbergen/kafka/consumergroup"
-	kazoo "github.com/wvanbergen/kazoo-go"
 )
 
 var (
@@ -40,9 +41,12 @@ func main() {
 	viper.SetConfigName("config")      // name of config file (without extension)
 	viper.AddConfigPath(*configFolder) // path to look for the config file in
 	viper.AddConfigPath(".")           // optionally look for config in the working directory
-	viper.SetDefault("producer.flush.fequency.seconds", 1*time.Second)
+	viper.SetDefault("producer.flush.fequency", 1*time.Second)
 	viper.SetDefault("producer.flush.bytes", 5388608)
 	viper.SetDefault("graphite.interval", 30*time.Second)
+	viper.SetDefault("producer.kafka.tls", false)
+	viper.SetDefault("producer.kafka.username", "")
+	viper.SetDefault("producer.kafka.password", "")
 	err := viper.ReadInConfig() // Find and read the config file
 	if err != nil {             // Handle errors reading the config file
 		panic(fmt.Errorf("fatal error config file: %s \n", err))
@@ -70,23 +74,37 @@ func main() {
 			log.Fatal("could not write memory profile: ", err)
 		}
 	}
-	prodKafkaVersion, err := sarama.ParseKafkaVersion(viper.GetString("producer.kafka.version"))
+	kafkaVersion, err := sarama.ParseKafkaVersion(viper.GetString("producer.kafka.version"))
 	if err != nil {
 		log.Println("Warning: Could not parse producer.kafka.version string, fallback to oldest stable version")
 	}
-	consKafkaVersion, err := sarama.ParseKafkaVersion(viper.GetString("consumer.kafka.version"))
-	if err != nil {
-		log.Println("Warning: Could not parse consumer.kafka.version string, fallback to oldest stable version")
-	}
-	// initialize kafka producer
+	// initialize kafka connection
 	cfg := sarama.NewConfig()
+	cfg.Version = kafkaVersion
+	cfg.ClientID = "mirrormaker"
 	cfg.Producer.Return.Successes = false
 	cfg.Producer.Return.Errors = true
-	cfg.ClientID = "mirrormaker"
-	// Set the configured compression codec
 	cfg.Producer.Compression = getCompressionCodec(viper.GetString("producer.compression"))
 	cfg.Producer.Retry.Max = 10
-	cfg.Version = prodKafkaVersion
+	// Setup Consumer
+	cfg.Consumer.Offsets.Initial = sarama.OffsetNewest
+	// cfg.Consumer.Offsets.ResetOffsets = false
+	cfg.Consumer.Offsets.CommitInterval = 10 * time.Second
+	cfg.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
+	cfg.Consumer.Return.Errors = true // allows to use ConsumerGroup.Errors()
+	if viper.GetBool("producer.kafka.tls") {
+		cfg.Net.TLS.Enable = true
+		cfg.Net.TLS.Config = &tls.Config{MinVersion: tls.VersionTLS12}
+		log.Println("Info: enabled kafka tls")
+	}
+	if viper.GetString("producer.kafka.username") != "" && viper.GetString("producer.kafka.password") != "" {
+		cfg.Net.SASL.Enable = true
+		cfg.Net.SASL.User = viper.GetString("producer.kafka.username")
+		cfg.Net.SASL.Password = viper.GetString("producer.kafka.password")
+		cfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+		log.Println("Info: setup kafka sasl")
+	}
+
 	client, err := sarama.NewClient(viper.GetStringSlice("producer.kafka.nodes"), cfg)
 	if err != nil {
 		log.Fatal(err)
@@ -103,33 +121,52 @@ func main() {
 		log.Fatalf("could not get partitions for target topic: %s", err)
 	}
 	numPartitions := len(part)
+	log.Printf("number partitions: %d", numPartitions)
+	// connect to consuming kafka
 	producer, err := sarama.NewAsyncProducerFromClient(client)
 	if err != nil {
 		log.Fatalf("could not open kafka connection: %s", err)
 	}
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	signalchannel := make(chan os.Signal, 1)
+	signal.Notify(signalchannel, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
-	// initialize zookeeper/kafka client configuration
-	var zkNodes []string
-	config := consumergroup.NewConfig()
-	config.Offsets.Initial = sarama.OffsetNewest
-	config.Offsets.ResetOffsets = false //for development only
-	config.Offsets.ProcessingTimeout = 10 * time.Second
-	config.Offsets.CommitInterval = 10 * time.Second
-	config.Version = consKafkaVersion
-	zkNodes, config.Zookeeper.Chroot = kazoo.ParseConnectionString(viper.GetString("consumer.zookeeper.connect"))
-
-	// connect to zookeeper/kafka
-	consumer, err := consumergroup.JoinConsumerGroup(viper.GetString("consumer.group.id"), []string{viper.GetString("consumer.topic")}, zkNodes, config)
+	// connect to consuming kafka
+	ctx, cancel := context.WithCancel(context.Background())
+	consumerGroup, err := sarama.NewConsumerGroupFromClient(viper.GetString("consumer.group.id"), client)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("could not start consumer group from client: %s", err)
 	}
-
 	pfxRegistry := metrics.NewPrefixedRegistry(viper.GetString("consumer.group.id") + ".")
-	metrics.NewRegisteredMeter(`messages.processed`,
-		pfxRegistry)
+	consumer := Consumer{
+		ready: make(chan bool),
+		producer: producer,
+		numPartitions: int32(numPartitions),
+		producerTopic: producerTopic,
+		partitioner: partitioner,
+		metrics: pfxRegistry,
+	}
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			// `Consume` should be called inside an infinite loop, when a
+			// server-side rebalance happens, the consumer session will need to be
+			// recreated to get the new claims
+			if err := consumerGroup.Consume(ctx, strings.Split(viper.GetString("consumer.topic"), ","), &consumer); err != nil {
+				log.Panicf("Error from consumer: %v", err)
+			}
+			// check if context was cancelled, signaling that the consumer should stop
+			if ctx.Err() != nil {
+				return
+			}
+			consumer.ready = make(chan bool)
+		}
+	}()
+	<-consumer.ready
+
+	metrics.NewRegisteredMeter(`messages.processed`, pfxRegistry)
 	if viper.GetString("graphite.address") != "" {
 		log.Println(`Launched metrics producer socket`)
 		addr, err := net.ResolveTCPAddr("tcp", viper.GetString("graphite.address"))
@@ -144,31 +181,25 @@ func main() {
 runloop:
 	for {
 		select {
-		case <-c:
-			// SIGINT/SIGTERM
+		case <-signalchannel:
 			break runloop
-		case e := <-consumer.Errors():
+		case <-ctx.Done():
+			break runloop
+		case e := <-consumerGroup.Errors():
 			log.Println(e)
 			metrics.GetOrRegisterMeter(`consumer.errors`, pfxRegistry).Mark(1)
-		case er := <-producer.Errors():
-			log.Println(er)
+		case e := <-producer.Errors():
+			log.Println(e)
 			metrics.GetOrRegisterMeter(`producer.errors`, pfxRegistry).Mark(1)
-		case message := <-consumer.Messages():
-			msg, err := PartitionMsg(partitioner, producerTopic, message, int32(numPartitions))
-			if err != nil {
-				log.Println(err)
-				break runloop
-			}
-			producer.Input() <- &msg
-			metrics.GetOrRegisterMeter(`messages.processed`, pfxRegistry).Mark(1)
-			consumer.CommitUpto(message)
 		}
 	}
 	c1 := make(chan string, 1)
 	go func() {
-		if err = consumer.Close(); err != nil {
+		if err = consumerGroup.Close(); err != nil {
 			log.Println("Error closing the consumer", err)
 		}
+		cancel()
+		wg.Wait()
 		c1 <- "consumer"
 	}()
 	go func() {
@@ -242,4 +273,47 @@ func PartitionMsg(partitioner, topic string, origmsg *sarama.ConsumerMessage, nu
 	default:
 		return sarama.ProducerMessage{}, fmt.Errorf("invalid partitioner defined")
 	}
+}
+
+// Consumer represents a Sarama consumer group consumer
+type Consumer struct {
+	ready chan bool
+	producer sarama.AsyncProducer
+	numPartitions int32
+	producerTopic string
+	partitioner string
+	metrics metrics.Registry
+}
+
+// Setup is run at the beginning of a new session, before ConsumeClaim
+func (consumer *Consumer) Setup(sarama.ConsumerGroupSession) error {
+	// Mark the consumer as ready
+	close(consumer.ready)
+	return nil
+}
+
+// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
+func (consumer *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
+func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	// NOTE:
+	// Do not move the code below to a goroutine.
+	// The `ConsumeClaim` itself is called within a goroutine, see:
+	// https://github.com/Shopify/sarama/blob/master/consumer_group.go#L27-L29
+	for message := range claim.Messages() {
+		msg, err := PartitionMsg(consumer.partitioner, consumer.producerTopic, message, consumer.numPartitions)
+		if err != nil {
+			log.Println(err)
+			return err
+		}
+		consumer.producer.Input() <- &msg
+		metrics.GetOrRegisterMeter(`messages.processed`, consumer.metrics).Mark(1)
+
+		// log.Printf("Message claimed: timestamp = %v, partition = %d, topic = %s, value = %s", message.Timestamp, message.Partition, message.Topic, string(message.Value))
+		session.MarkMessage(message, "")
+	}
+	return nil
 }

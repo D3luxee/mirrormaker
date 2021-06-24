@@ -4,6 +4,9 @@ kafka.nodes = [
 	"node2:9092",
 ]
 kafka.topic = "some_dst_topic"
+kafka.tls = true
+kafka.username = "kafka"
+kafka.password = "kafka"
 compression = "snappy"
 #Partitioner: hash, keepPartition, random
 partitioner = "hash"
@@ -11,7 +14,6 @@ flush.fequency = 1s
 flush.bytes = 5388608
 
 [consumer]
-zookeeper.connect = "zookeeper:2181/zkroot"
 group.id = "my-consumer-group"
 topic = "mytopic"
 
