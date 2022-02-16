@@ -5,6 +5,10 @@ kafka.nodes = [
 ]
 kafka.topic = "some_dst_topic"
 kafka.tls = true
+kafka.tls-cafile = "/path/to/ca.crt"
+kafka.tls-certfile = "/path/to/cert.crt"
+kafka.tls-keyfile = "/path/to/cert.key"
+kafka.tls-skip-verify = false
 kafka.username = "kafka"
 kafka.password = "kafka"
 compression = "snappy"
@@ -14,8 +18,18 @@ flush.fequency = 1s
 flush.bytes = 5388608
 
 [consumer]
+kafka.nodes = [
+	"node1:9092",
+	"node2:9092",
+]
+kafka.topic = "some_dst_topic"
+kafka.tls = true
+kafka.tls-cafile = "/path/to/ca.crt"
+kafka.tls-certfile = "/path/to/cert.crt"
+kafka.tls-keyfile = "/path/to/cert.key"
+kafka.username = "kafka"
+kafka.password = "kafka"
 group.id = "my-consumer-group"
-topic = "mytopic"
 
 [graphite]
 address = "metrics.lan:2003"

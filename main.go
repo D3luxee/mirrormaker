@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -10,13 +12,14 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-	"context"
-	"sync"
+
+	"crypto/tls"
+	"crypto/x509"
 
 	"github.com/Shopify/sarama"
-	"crypto/tls"
 	graphite "github.com/cyberdelia/go-metrics-graphite"
 	"github.com/rcrowley/go-metrics"
 
@@ -45,11 +48,24 @@ func main() {
 	viper.SetDefault("producer.flush.bytes", 5388608)
 	viper.SetDefault("graphite.interval", 30*time.Second)
 	viper.SetDefault("producer.kafka.tls", false)
+	viper.SetDefault("producer.kafka.tls-skip-verify", false)
+	viper.SetDefault("producer.kafka.tls-cafile", "")
+	viper.SetDefault("producer.kafka.tls-certfile", "")
+	viper.SetDefault("producer.kafka.tls-keyfile", "")
 	viper.SetDefault("producer.kafka.username", "")
 	viper.SetDefault("producer.kafka.password", "")
+
+	viper.SetDefault("consumer.kafka.tls", false)
+	viper.SetDefault("consumer.kafka.tls-skip-verify", false)
+	viper.SetDefault("consumer.kafka.tls-cafile", "")
+	viper.SetDefault("consumer.kafka.tls-certfile", "")
+	viper.SetDefault("consumer.kafka.tls-keyfile", "")
+	viper.SetDefault("consumer.kafka.username", "")
+	viper.SetDefault("consumer.kafka.password", "")
+
 	err := viper.ReadInConfig() // Find and read the config file
 	if err != nil {             // Handle errors reading the config file
-		panic(fmt.Errorf("fatal error config file: %s \n", err))
+		panic(fmt.Errorf("fatal error config file: %s", err))
 	}
 
 	if *cpuprofile != "" {
@@ -74,58 +90,37 @@ func main() {
 			log.Fatal("could not write memory profile: ", err)
 		}
 	}
-	kafkaVersion, err := sarama.ParseKafkaVersion(viper.GetString("producer.kafka.version"))
-	if err != nil {
-		log.Println("Warning: Could not parse producer.kafka.version string, fallback to oldest stable version")
-	}
-	// initialize kafka connection
-	cfg := sarama.NewConfig()
-	cfg.Version = kafkaVersion
-	cfg.ClientID = "mirrormaker"
-	cfg.Producer.Return.Successes = false
-	cfg.Producer.Return.Errors = true
-	cfg.Producer.Compression = getCompressionCodec(viper.GetString("producer.compression"))
-	cfg.Producer.Retry.Max = 10
-	// Setup Consumer
-	cfg.Consumer.Offsets.Initial = sarama.OffsetNewest
-	// cfg.Consumer.Offsets.ResetOffsets = false
-	cfg.Consumer.Offsets.CommitInterval = 10 * time.Second
-	cfg.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
-	cfg.Consumer.Return.Errors = true // allows to use ConsumerGroup.Errors()
-	if viper.GetBool("producer.kafka.tls") {
-		cfg.Net.TLS.Enable = true
-		cfg.Net.TLS.Config = &tls.Config{MinVersion: tls.VersionTLS12}
-		log.Println("Info: enabled kafka tls")
-	}
-	if viper.GetString("producer.kafka.username") != "" && viper.GetString("producer.kafka.password") != "" {
-		cfg.Net.SASL.Enable = true
-		cfg.Net.SASL.User = viper.GetString("producer.kafka.username")
-		cfg.Net.SASL.Password = viper.GetString("producer.kafka.password")
-		cfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
-		log.Println("Info: setup kafka sasl")
-	}
 
-	client, err := sarama.NewClient(viper.GetStringSlice("producer.kafka.nodes"), cfg)
+	// Setup Producer
+	producerCFG := setupProducer()
+	producerClient, err := sarama.NewClient(viper.GetStringSlice("producer.kafka.nodes"), producerCFG)
 	if err != nil {
 		log.Fatal(err)
 	}
-	cfg.Producer.Flush.Frequency = viper.GetDuration("producer.flush.fequency")
-	cfg.Producer.Flush.Bytes = viper.GetInt("producer.flush.bytes")
+
 	partitioner := strings.ToLower(viper.GetString("producer.partitioner"))
 	if partitioner == "keeppartition" || partitioner == "modulo" {
-		cfg.Producer.Partitioner = sarama.NewManualPartitioner
+		producerCFG.Producer.Partitioner = sarama.NewManualPartitioner
 	}
 	producerTopic := viper.GetString("producer.kafka.topic")
-	part, err := client.Partitions(producerTopic)
+	part, err := producerClient.Partitions(producerTopic)
 	if err != nil {
 		log.Fatalf("could not get partitions for target topic: %s", err)
 	}
 	numPartitions := len(part)
 	log.Printf("number partitions: %d", numPartitions)
-	// connect to consuming kafka
-	producer, err := sarama.NewAsyncProducerFromClient(client)
+	// connect to producer kafka
+	producer, err := sarama.NewAsyncProducerFromClient(producerClient)
 	if err != nil {
 		log.Fatalf("could not open kafka connection: %s", err)
+	}
+	// END Setup Producer
+
+	// Setup Consumer
+	consumerCFG := setupConsumer()
+	consumerClient, err := sarama.NewClient(viper.GetStringSlice("consumer.kafka.nodes"), consumerCFG)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	signalchannel := make(chan os.Signal, 1)
@@ -133,18 +128,18 @@ func main() {
 
 	// connect to consuming kafka
 	ctx, cancel := context.WithCancel(context.Background())
-	consumerGroup, err := sarama.NewConsumerGroupFromClient(viper.GetString("consumer.group.id"), client)
+	consumerGroup, err := sarama.NewConsumerGroupFromClient(viper.GetString("consumer.group.id"), consumerClient)
 	if err != nil {
 		log.Fatalf("could not start consumer group from client: %s", err)
 	}
 	pfxRegistry := metrics.NewPrefixedRegistry(viper.GetString("consumer.group.id") + ".")
 	consumer := Consumer{
-		ready: make(chan bool),
-		producer: producer,
+		ready:         make(chan bool),
+		producer:      producer,
 		numPartitions: int32(numPartitions),
 		producerTopic: producerTopic,
-		partitioner: partitioner,
-		metrics: pfxRegistry,
+		partitioner:   partitioner,
+		metrics:       pfxRegistry,
 	}
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
@@ -198,6 +193,9 @@ runloop:
 		if err = consumerGroup.Close(); err != nil {
 			log.Println("Error closing the consumer", err)
 		}
+		if err = consumerClient.Close(); err != nil {
+			log.Println("Error closing the consumer", err)
+		}
 		cancel()
 		wg.Wait()
 		c1 <- "consumer"
@@ -206,7 +204,9 @@ runloop:
 		if err = producer.Close(); err != nil {
 			log.Println("Error closing the producer", err)
 		}
-		client.Close()
+		if err = producerClient.Close(); err != nil {
+			log.Println("Error closing the producer client", err)
+		}
 		c1 <- "producer"
 	}()
 	var closecnt int
@@ -240,7 +240,7 @@ func getCompressionCodec(comp string) sarama.CompressionCodec {
 
 func PartitionMsg(partitioner, topic string, origmsg *sarama.ConsumerMessage, numPartitions int32) (sarama.ProducerMessage, error) {
 	if partitioner == "" || topic == "" {
-		return sarama.ProducerMessage{}, fmt.Errorf("configuration error, partitioner or topic was not set.")
+		return sarama.ProducerMessage{}, fmt.Errorf("configuration error, partitioner or topic was not set")
 	}
 	if len(origmsg.Value) == 0 {
 		return sarama.ProducerMessage{}, fmt.Errorf("value is not set")
@@ -258,7 +258,7 @@ func PartitionMsg(partitioner, topic string, origmsg *sarama.ConsumerMessage, nu
 	case "keeppartition":
 		//we set the target partition is set to the source partition
 		if origmsg.Partition > numPartitions-1 {
-			return sarama.ProducerMessage{}, fmt.Errorf("the dest topic has less partitions than the source, this is an invalid configuration and not compatible with keep partition.")
+			return sarama.ProducerMessage{}, fmt.Errorf("the dest topic has less partitions than the source, this is an invalid configuration and not compatible with keep partition")
 		}
 		return sarama.ProducerMessage{Topic: topic, Partition: origmsg.Partition, Key: sarama.ByteEncoder(origmsg.Key), Value: sarama.ByteEncoder(origmsg.Value)}, nil
 	case "modulo":
@@ -275,14 +275,44 @@ func PartitionMsg(partitioner, topic string, origmsg *sarama.ConsumerMessage, nu
 	}
 }
 
+func tlsConfig(TLSCertFile, TLSKeyFile, CAFile string, TLSSkipVerify bool) *tls.Config {
+	var t *tls.Config
+
+	caCertPool, err := x509.SystemCertPool()
+	if err != nil {
+		log.Fatal("could not load system cert pool: ", err)
+	}
+	t = &tls.Config{
+		RootCAs:            caCertPool,
+		InsecureSkipVerify: TLSSkipVerify,
+	}
+	if TLSCertFile != "" || TLSKeyFile != "" || CAFile != "" {
+		cert, err := tls.LoadX509KeyPair(TLSCertFile, TLSKeyFile)
+		if err != nil {
+			log.Fatal("kafka TLS load X509 key pair error: ", err)
+		}
+
+		caCert, err := ioutil.ReadFile(CAFile)
+		if err != nil {
+			log.Fatal("kafka TLS CA file error: ", err)
+		}
+
+		caCertPool.AppendCertsFromPEM(caCert)
+
+		t.Certificates = []tls.Certificate{cert}
+	}
+
+	return t
+}
+
 // Consumer represents a Sarama consumer group consumer
 type Consumer struct {
-	ready chan bool
-	producer sarama.AsyncProducer
+	ready         chan bool
+	producer      sarama.AsyncProducer
 	numPartitions int32
 	producerTopic string
-	partitioner string
-	metrics metrics.Registry
+	partitioner   string
+	metrics       metrics.Registry
 }
 
 // Setup is run at the beginning of a new session, before ConsumeClaim
@@ -316,4 +346,75 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 		session.MarkMessage(message, "")
 	}
 	return nil
+}
+
+func setupProducer() *sarama.Config {
+	// initialize kafka producer
+	producerKafkaVersion, err := sarama.ParseKafkaVersion(viper.GetString("producer.kafka.version"))
+	if err != nil {
+		log.Printf("could not parse producer kafka version fallback to default version: %s", producerKafkaVersion.String())
+	}
+	producerCFG := sarama.NewConfig()
+	producerCFG.Version = producerKafkaVersion
+	producerCFG.ClientID = "mirrormaker"
+	producerCFG.Producer.Return.Successes = false
+	producerCFG.Producer.Return.Errors = true
+	producerCFG.Producer.Compression = getCompressionCodec(viper.GetString("producer.compression"))
+	producerCFG.Producer.Retry.Max = 10
+	producerCFG.Producer.Flush.Frequency = viper.GetDuration("producer.flush.fequency")
+	producerCFG.Producer.Flush.Bytes = viper.GetInt("producer.flush.bytes")
+	if viper.GetBool("producer.kafka.tls") {
+		producerCFG.Net.TLS.Enable = true
+		producerCFG.Net.TLS.Config = tlsConfig(
+			viper.GetString("producer.kafka.tls-certfile"),
+			viper.GetString("producer.kafka.tls-keyfile"),
+			viper.GetString("producer.kafka.tls-cafile"),
+			viper.GetBool("producer.kafka.tls-skip-verify"))
+
+		log.Println("Info: enabled kafka tls")
+	}
+	if viper.GetString("producer.kafka.username") != "" && viper.GetString("producer.kafka.password") != "" {
+		producerCFG.Net.SASL.Enable = true
+		producerCFG.Net.SASL.User = viper.GetString("producer.kafka.username")
+		producerCFG.Net.SASL.Password = viper.GetString("producer.kafka.password")
+		producerCFG.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+		log.Println("Info: setup kafka sasl")
+	}
+	return producerCFG
+}
+
+func setupConsumer() *sarama.Config {
+	// initialize kafka producer
+	consumerKafkaVersion, err := sarama.ParseKafkaVersion(viper.GetString("consumer.kafka.version"))
+	if err != nil {
+		log.Printf("could not parse consumer kafka version fallback to default version: %s", consumerKafkaVersion.String())
+	}
+	consumerCFG := sarama.NewConfig()
+	consumerCFG.Consumer.Offsets.Initial = sarama.OffsetNewest
+	// producerCFG.Consumer.Offsets.ResetOffsets = false
+	consumerCFG.Consumer.Offsets.CommitInterval = 10 * time.Second
+	consumerCFG.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
+
+	consumerCFG.Consumer.Return.Errors = true // allows to use ConsumerGroup.Errors()
+	consumerCFG.Version = consumerKafkaVersion
+
+	consumerCFG.ClientID = "mirrormaker"
+	if viper.GetBool("consumer.kafka.tls") {
+		consumerCFG.Net.TLS.Enable = true
+		consumerCFG.Net.TLS.Config = tlsConfig(
+			viper.GetString("consumer.kafka.tls-certfile"),
+			viper.GetString("consumer.kafka.tls-keyfile"),
+			viper.GetString("consumer.kafka.tls-cafile"),
+			viper.GetBool("consumer.kafka.tls-skip-verify"))
+
+		log.Println("Info: enabled kafka tls")
+	}
+	if viper.GetString("consumer.kafka.username") != "" && viper.GetString("consumer.kafka.password") != "" {
+		consumerCFG.Net.SASL.Enable = true
+		consumerCFG.Net.SASL.User = viper.GetString("consumer.kafka.username")
+		consumerCFG.Net.SASL.Password = viper.GetString("consumer.kafka.password")
+		consumerCFG.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+		log.Println("Info: setup kafka sasl")
+	}
+	return consumerCFG
 }
