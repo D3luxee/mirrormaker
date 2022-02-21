@@ -14,8 +14,8 @@ import (
 // to the correct broker for the provided topic-partition, refreshing metadata as appropriate,
 // and parses responses for errors. You must read from the Errors() channel or the
 // producer will deadlock. You must call Close() or AsyncClose() on a producer to avoid
-// leaks: it will not be garbage-collected automatically when it passes out of
-// scope.
+// leaks and message lost: it will not be garbage-collected automatically when it passes
+// out of scope and buffered messages may not be flushed.
 type AsyncProducer interface {
 
 	// AsyncClose triggers a shutdown of the producer. The shutdown has completed
@@ -26,7 +26,8 @@ type AsyncProducer interface {
 
 	// Close shuts down the producer and waits for any buffered messages to be
 	// flushed. You must call this function before a producer object passes out of
-	// scope, as it may otherwise leak memory. You must call this before calling
+	// scope, as it may otherwise leak memory. You must call this before process
+	// shutting down, or you may lose messages. You must call this before calling
 	// Close on the underlying client.
 	Close() error
 
@@ -206,7 +207,7 @@ type ProducerMessage struct {
 	// Partition is the partition that the message was sent to. This is only
 	// guaranteed to be defined if the message was successfully delivered.
 	Partition int32
-	// Timestamp can vary in behaviour depending on broker configuration, being
+	// Timestamp can vary in behavior depending on broker configuration, being
 	// in either one of the CreateTime or LogAppendTime modes (default CreateTime),
 	// and requiring version at least 0.10.0.
 	//
@@ -694,12 +695,30 @@ func (p *asyncProducer) newBrokerProducer(broker *Broker) *brokerProducer {
 		for set := range bridge {
 			request := set.buildRequest()
 
-			response, err := broker.Produce(request)
+			// Capture the current set to forward in the callback
+			sendResponse := func(set *produceSet) ProduceCallback {
+				return func(response *ProduceResponse, err error) {
+					responses <- &brokerProducerResponse{
+						set: set,
+						err: err,
+						res: response,
+					}
+				}
+			}(set)
 
-			responses <- &brokerProducerResponse{
-				set: set,
-				err: err,
-				res: response,
+			// Use AsyncProduce vs Produce to not block waiting for the response
+			// so that we can pipeline multiple produce requests and achieve higher throughput, see:
+			// https://kafka.apache.org/protocol#protocol_network
+			err := broker.AsyncProduce(request, sendResponse)
+			if err != nil {
+				// Request failed to be sent
+				sendResponse(nil, err)
+				continue
+			}
+			// Callback is not called when using NoResponse
+			if p.conf.Producer.RequiredAcks == NoResponse {
+				// Provide the expected nil response
+				sendResponse(nil, nil)
 			}
 		}
 		close(responses)
