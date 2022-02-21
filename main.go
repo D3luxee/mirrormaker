@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -146,15 +147,18 @@ func main() {
 	go func() {
 		defer wg.Done()
 		for {
+			// check if context was cancelled, signaling that the consumer should stop
+			if ctx.Err() != nil {
+				return
+			}
 			// `Consume` should be called inside an infinite loop, when a
 			// server-side rebalance happens, the consumer session will need to be
 			// recreated to get the new claims
 			if err := consumerGroup.Consume(ctx, strings.Split(viper.GetString("consumer.kafka.topic"), ","), &consumer); err != nil {
+				if errors.Is(err, sarama.ErrClosedConsumerGroup) {
+					return
+				}
 				log.Panicf("Error from consumer: %v", err)
-			}
-			// check if context was cancelled, signaling that the consumer should stop
-			if ctx.Err() != nil {
-				return
 			}
 			consumer.ready = make(chan bool)
 		}
@@ -170,7 +174,8 @@ func main() {
 		}
 		go graphite.Graphite(pfxRegistry, viper.GetDuration("graphite.interval"), viper.GetString("graphite.prefix"), addr)
 	}
-	log.Println("Connection to Zookeeper and Kafka established.")
+	go metrics.Log(pfxRegistry, 30*time.Second, log.New(os.Stdout, "metrics: ", log.Lmicroseconds))
+	log.Println("Connection to consumer and producer cluster established")
 	log.Printf("Using partitioner %s\n", partitioner)
 
 runloop:
