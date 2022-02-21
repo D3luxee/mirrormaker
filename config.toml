@@ -3,6 +3,7 @@ kafka.nodes = [
 	"node1:9092",
 	"node2:9092",
 ]
+kafka.version = "2.8.0"
 kafka.topic = "some_dst_topic"
 kafka.tls = true
 kafka.tls-cafile = "/path/to/ca.crt"
@@ -27,6 +28,7 @@ kafka.tls = true
 kafka.tls-cafile = "/path/to/ca.crt"
 kafka.tls-certfile = "/path/to/cert.crt"
 kafka.tls-keyfile = "/path/to/cert.key"
+kafka.tls-skip-verify = false
 kafka.username = "kafka"
 kafka.password = "kafka"
 group.id = "my-consumer-group"

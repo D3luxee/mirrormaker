@@ -149,7 +149,7 @@ func main() {
 			// `Consume` should be called inside an infinite loop, when a
 			// server-side rebalance happens, the consumer session will need to be
 			// recreated to get the new claims
-			if err := consumerGroup.Consume(ctx, strings.Split(viper.GetString("consumer.topic"), ","), &consumer); err != nil {
+			if err := consumerGroup.Consume(ctx, strings.Split(viper.GetString("consumer.kafka.topic"), ","), &consumer); err != nil {
 				log.Panicf("Error from consumer: %v", err)
 			}
 			// check if context was cancelled, signaling that the consumer should stop
