@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -63,6 +62,7 @@ func main() {
 	viper.SetDefault("consumer.kafka.tls-keyfile", "")
 	viper.SetDefault("consumer.kafka.username", "")
 	viper.SetDefault("consumer.kafka.password", "")
+	viper.SetDefault("consumer.offset.retention", "1h")
 
 	err := viper.ReadInConfig() // Find and read the config file
 	if err != nil {             // Handle errors reading the config file
@@ -155,9 +155,6 @@ func main() {
 			// server-side rebalance happens, the consumer session will need to be
 			// recreated to get the new claims
 			if err := consumerGroup.Consume(ctx, strings.Split(viper.GetString("consumer.kafka.topic"), ","), &consumer); err != nil {
-				if errors.Is(err, sarama.ErrClosedConsumerGroup) {
-					return
-				}
 				log.Panicf("Error from consumer: %v", err)
 			}
 			consumer.ready = make(chan bool)
@@ -174,7 +171,9 @@ func main() {
 		}
 		go graphite.Graphite(pfxRegistry, viper.GetDuration("graphite.interval"), viper.GetString("graphite.prefix"), addr)
 	}
-	go metrics.Log(pfxRegistry, 30*time.Second, log.New(os.Stdout, "metrics: ", log.Lmicroseconds))
+	if viper.GetBool("graphite.metric.logging") {
+		go metrics.Log(pfxRegistry, 30*time.Second, log.New(os.Stdout, "metrics: ", log.Lmicroseconds))
+	}
 	log.Println("Connection to consumer and producer cluster established")
 	log.Printf("Using partitioner %s\n", partitioner)
 
@@ -396,7 +395,7 @@ func setupConsumer() *sarama.Config {
 	}
 	consumerCFG := sarama.NewConfig()
 	consumerCFG.Consumer.Offsets.Initial = sarama.OffsetNewest
-	// producerCFG.Consumer.Offsets.ResetOffsets = false
+	consumerCFG.Consumer.Offsets.Retention = viper.GetDuration("consumer.offset.retention")
 	consumerCFG.Consumer.Offsets.CommitInterval = 10 * time.Second
 	consumerCFG.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
 

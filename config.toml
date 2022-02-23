@@ -32,8 +32,10 @@ kafka.tls-skip-verify = false
 kafka.username = "kafka"
 kafka.password = "kafka"
 group.id = "my-consumer-group"
+offset.retention = 1h
 
 [graphite]
 address = "metrics.lan:2003"
 prefix = "some.$hostname"
 interval = 30s
+metric.logging = false
