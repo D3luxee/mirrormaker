@@ -68,6 +68,7 @@ func main() {
 	if err != nil {             // Handle errors reading the config file
 		panic(fmt.Errorf("fatal error config file: %s", err))
 	}
+	sarama.Logger = log.Default()
 
 	if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)
@@ -186,9 +187,11 @@ runloop:
 			break runloop
 		case e := <-consumerGroup.Errors():
 			log.Println(e)
+			break runloop
 			metrics.GetOrRegisterMeter(`consumer.errors`, pfxRegistry).Mark(1)
 		case e := <-producer.Errors():
 			log.Println(e)
+			break runloop
 			metrics.GetOrRegisterMeter(`producer.errors`, pfxRegistry).Mark(1)
 		}
 	}
@@ -344,10 +347,10 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 			return err
 		}
 		consumer.producer.Input() <- &msg
+		session.MarkMessage(message, "")
 		metrics.GetOrRegisterMeter(`messages.processed`, consumer.metrics).Mark(1)
 
 		// log.Printf("Message claimed: timestamp = %v, partition = %d, topic = %s, value = %s", message.Timestamp, message.Partition, message.Topic, string(message.Value))
-		session.MarkMessage(message, "")
 	}
 	return nil
 }
@@ -396,9 +399,7 @@ func setupConsumer() *sarama.Config {
 	consumerCFG := sarama.NewConfig()
 	consumerCFG.Consumer.Offsets.Initial = sarama.OffsetNewest
 	consumerCFG.Consumer.Offsets.Retention = viper.GetDuration("consumer.offset.retention")
-	consumerCFG.Consumer.Offsets.CommitInterval = 10 * time.Second
 	consumerCFG.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
-
 	consumerCFG.Consumer.Return.Errors = true // allows to use ConsumerGroup.Errors()
 	consumerCFG.Version = consumerKafkaVersion
 
