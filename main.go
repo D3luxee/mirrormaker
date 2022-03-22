@@ -156,7 +156,7 @@ func main() {
 			// server-side rebalance happens, the consumer session will need to be
 			// recreated to get the new claims
 			if err := consumerGroup.Consume(ctx, strings.Split(viper.GetString("consumer.kafka.topic"), ","), &consumer); err != nil {
-				log.Panicf("Error from consumer: %v", err)
+				log.Fatalf("Error from consumer: %v", err)
 			}
 			consumer.ready = make(chan bool)
 		}
@@ -186,20 +186,21 @@ runloop:
 		case <-ctx.Done():
 			break runloop
 		case e := <-consumerGroup.Errors():
-			log.Println(e)
+			log.Printf("ConsumerError %v", e)
 			break runloop
-			metrics.GetOrRegisterMeter(`consumer.errors`, pfxRegistry).Mark(1)
 		case e := <-producer.Errors():
-			log.Println(e)
+			//log.Println(e)
+			log.Printf("ProducerError %s", e)
 			break runloop
-			metrics.GetOrRegisterMeter(`producer.errors`, pfxRegistry).Mark(1)
 		}
 	}
 	c1 := make(chan string, 1)
 	go func() {
+		log.Println("shutdown consumer group")
 		if err = consumerGroup.Close(); err != nil {
 			log.Println("Error closing the consumer", err)
 		}
+		log.Println("shutdown consumer client")
 		if err = consumerClient.Close(); err != nil {
 			log.Println("Error closing the consumer", err)
 		}
@@ -208,9 +209,11 @@ runloop:
 		c1 <- "consumer"
 	}()
 	go func() {
+		log.Println("shutdown producer")
 		if err = producer.Close(); err != nil {
 			log.Println("Error closing the producer", err)
 		}
+		log.Println("shutdown producer client")
 		if err = producerClient.Close(); err != nil {
 			log.Println("Error closing the producer client", err)
 		}
@@ -225,8 +228,8 @@ runloop:
 			if closecnt == 2 {
 				os.Exit(0)
 			}
-		case <-time.After(5 * time.Minute):
-			fmt.Println("could not stop consumer or producer within the defined timeout of 5 minutes")
+		case <-time.After(1 * time.Minute):
+			fmt.Println("could not stop consumer or producer within the defined timeout of 1 minutes")
 			os.Exit(1)
 		}
 	}
@@ -367,7 +370,7 @@ func setupProducer() *sarama.Config {
 	producerCFG.Producer.Return.Successes = false
 	producerCFG.Producer.Return.Errors = true
 	producerCFG.Producer.Compression = getCompressionCodec(viper.GetString("producer.compression"))
-	producerCFG.Producer.Retry.Max = 10
+	producerCFG.Producer.Retry.Max = 5
 	producerCFG.Producer.Flush.Frequency = viper.GetDuration("producer.flush.fequency")
 	producerCFG.Producer.Flush.Bytes = viper.GetInt("producer.flush.bytes")
 	if viper.GetBool("producer.kafka.tls") {
